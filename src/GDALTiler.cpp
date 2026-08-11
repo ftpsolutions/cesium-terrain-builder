@@ -247,12 +247,19 @@ getOverviewDataset(GDALDatasetH hSrcDS, GDALTransformerFunc pfnTransformer, void
                 {
                   //std::cout << "CTB WARPING: Selecting overview level " << iOvr << " for output dataset " << nPixels << "x" << nLines << std::endl;
                 #if ( GDAL_VERSION_MAJOR >= 3 )
+                  // GDALCreateOverviewDataset() is declared in gdal_priv.h but isn't exported from
+                  //  libgdal on GDAL 3, so go through the documented OVERVIEW_LEVEL open option
+                  //  instead. GDAL_OF_SHARED matters: this runs once per tile, and without it we'd
+                  //  re-open (and re-parse the headers of) the source raster tens of thousands of
+                  //  times. Shared datasets are keyed per thread, so each tiling thread ends up
+                  //  holding one handle per overview level rather than one per tile.
+                  // NOTE: the caller owns what we return and must GDALClose() it- see createRasterTile().
                   const char *pszSrcDescription = poSrcDS->GetDescription();
                   if( pszSrcDescription != NULL && strlen(pszSrcDescription) > 0 )
                     {
                       char **papszOpenOptions = NULL;
                       papszOpenOptions = CSLSetNameValue(papszOpenOptions, "OVERVIEW_LEVEL", CPLSPrintf("%d", iOvr));
-                      poSrcOvrDS = static_cast<GDALDataset *>(GDALOpenEx(pszSrcDescription, GDAL_OF_RASTER, NULL, papszOpenOptions, NULL));
+                      poSrcOvrDS = static_cast<GDALDataset *>(GDALOpenEx(pszSrcDescription, GDAL_OF_RASTER | GDAL_OF_SHARED, NULL, papszOpenOptions, NULL));
                       CSLDestroy(papszOpenOptions);
                     }
                 #elif ( GDAL_VERSION_MAJOR >= 2 )
@@ -383,6 +390,15 @@ GDALTiler::createRasterTile(GDALDataset *dataset, double (&adfGeoTransform)[6]) 
 
   // The raster tile is represented as a VRT dataset
   hDstDS = GDALCreateWarpedVRT(hWrkSrcDS, mGrid.tileSize(), mGrid.tileSize(), adfGeoTransform, psWarpOptions);
+
+  // We own whatever getOverviewDataset() handed back. GDALCreateWarpedVRT() only reads band
+  //  metadata off this dataset while it's building (it warps from psWarpOptions->hSrcDS), so it's
+  //  safe- and necessary- to hand it back now. Leaking it costs a file descriptor per tile, which
+  //  silently halts tiling at the process open-file limit *and still exits 0*, leaving a partial
+  //  tileset behind a layer.json that claims every zoom is available.
+  if (hWrkSrcDS != NULL && hWrkSrcDS != hSrcDS) {
+    GDALClose(hWrkSrcDS);
+  }
 
   bool isApproxTransform = (psWarpOptions->pfnTransformer == GDALApproxTransform);
   GDALDestroyWarpOptions( psWarpOptions );
